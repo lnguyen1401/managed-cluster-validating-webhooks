@@ -1,17 +1,21 @@
 package podimagespec
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"regexp"
 
+	"github.com/openshift/managed-cluster-validating-webhooks/pkg/k8sutil"
 	"github.com/openshift/managed-cluster-validating-webhooks/pkg/webhooks/utils"
-	"github.com/openshift/managed-cluster-validating-webhooks/pkg/webhooks/k8sutil"
 
+	configv1 "github.com/openshift/api/imageregistry/v1"
+	operatorv1 "github.com/openshift/api/operator/v1"
 	admissionregv1 "k8s.io/api/admissionregistration/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	admissionctl "sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 )
@@ -37,22 +41,43 @@ var (
 			},
 		},
 	}
-	log = logf.Log.WithName(WebhookName)
-	imageRegex = regexp.MustCompile(`(image-registry.openshift-image-registry.svc:5000\/\)\(?P<namespace>openshift)(/)(?P<image>\S*)(:)(?P<tag>\S*)`)
-	client = k8sutil.MustHaveContainerClient()
+	log        = logf.Log.WithName(WebhookName)
+	imageRegex = regexp.MustCompile(`(image-registry\.openshift-image-registry\.svc:5000\/)(?P<namespace>\S*)(/)(?P<image>\S*)(:)(?P<tag>\S*)`)
+	kubeClient = k8sutil.MustHaveContainerClient()
 )
 
 // PodImageSpecWebhook mutates an image spec in a pod
 type PodImageSpecWebhook struct {
-	s runtime.Scheme
+	s        runtime.Scheme
+	configV1 configv1.Config
 }
 
 // NewWebhook creates the new webhook
 func NewWebhook() *PodImageSpecWebhook {
 	scheme := runtime.NewScheme()
+	configV1 := &configv1.Config{}
 	return &PodImageSpecWebhook{
-		s: *scheme,
+		s:        *scheme,
+		configV1: *configV1,
 	}
+}
+
+// CheckImageRegistryStatus checks the status of the image registry service
+func (s *PodImageSpecWebhook) CheckImageRegistryStatus(ctx context.Context) (bool, error) {
+	err := kubeClient.Client.Get(ctx, client.ObjectKey{
+		Name: "cluster",
+	}, &s.configV1)
+	if err != nil {
+		return false, fmt.Errorf("failed to get image registry config: %v", err)
+	}
+
+	if s.configV1.Spec.ManagementState == operatorv1.Managed {
+		return true, nil
+	} else if s.configV1.Spec.ManagementState == operatorv1.Removed {
+		return false, nil
+	}
+
+	return false, fmt.Errorf("unknown managementState: %s", s.configV1.Spec.ManagementState)
 }
 
 // Authorized implements Webhook interface
@@ -69,7 +94,7 @@ func (s *PodImageSpecWebhook) Authorized(request admissionctl.Request) admission
 // kube client?
 // generate on boot
 // permissions for webhook service account
-// get kubeconfig from webhook service acount 
+// get kubeconfig from webhook service acount
 // make sure service account token is in the pod
 // ask micheal shen about where to put kubeclient
 
@@ -83,27 +108,44 @@ func (s *PodImageSpecWebhook) authorizeOrMutate(request admissionctl.Request) ad
 		log.Error(err, "Couldn't render a Pod from the incoming request")
 		return admissionctl.Errored(http.StatusBadRequest, err)
 	}
-
+	//1. Regex match
 	mutated := false
-	for _ ,container := range pod.Spec.Containers {
-		mutated, err := mutateContainerImageSpec(container.Image)
+	for i := range pod.Spec.Containers {
+		container := &pod.Spec.Containers[i]
+		imageMutated, err := mutateContainerImageSpec(&container.Image)
 		if err != nil {
 			return admissionctl.Errored(http.StatusBadRequest, err)
+		}
+		if imageMutated {
+			mutated = true
+		}
 	}
-
+	//if the regex does not match, check image-registry status
 	if mutated {
-		ret = admissionctl.Patched(
-			fmt.Sprintf("images on pod %s mutated for reliablity", pod.GetName()),
-		)
+		ctx := context.Background()
+		//check if image-registry is enabled
+		registryAvailable, err := s.CheckImageRegistryStatus(ctx)
+		if err != nil {
+			log.Error(err, "Failed to check image registry status")
+			return admissionctl.Errored(http.StatusInternalServerError, err)
+		}
+		if !registryAvailable {
+			ret = admissionctl.Patched(
+				fmt.Sprintf("images on pod %s mutated for reliability", pod.GetName()),
+			)
 
-		log.Info(fmt.Sprintf("images on pod %s mutated for reliablity", pod.GetName()))
-		// ret.Complete() sets the UID and finalizes the patch
-		ret.Complete(request)
+			log.Info(fmt.Sprintf("images on pod %s mutated for reliablity", pod.GetName()))
+			// ret.Complete() sets the UID and finalizes the patch
+			ret.Complete(request)
+		} else {
+			ret = admissionctl.Allowed("Image registry is available, no mutation required")
+			ret.UID = request.AdmissionRequest.UID
+		}
 	} else {
 		ret = admissionctl.Allowed("Pod image spec is valid")
-		ret.UID = request.AdmissionRequest.UID	
+		ret.UID = request.AdmissionRequest.UID
 	}
-	
+
 	return ret
 }
 
@@ -114,7 +156,7 @@ func (s *PodImageSpecWebhook) renderPod(request admissionctl.Request) (*corev1.P
 		return nil, err
 	}
 	pod := &corev1.Pod{}
-	if len(req.OldObject.Raw) > 0 {
+	if len(request.OldObject.Raw) > 0 {
 		err = decoder.DecodeRaw(request.OldObject, pod)
 	} else {
 		err = decoder.DecodeRaw(request.Object, pod)
@@ -129,33 +171,33 @@ func (s *PodImageSpecWebhook) renderPod(request admissionctl.Request) (*corev1.P
 func checkContainerImageSpecByRegex(imagespec string) (bool, string, string, string, error) {
 
 	matches := imageRegex.FindStringSubmatch(imagespec)
+	if matches == nil {
+		return false, "", "", "", nil
+	}
 	namespaceIndex := imageRegex.SubexpIndex("namespace")
 	imageIndex := imageRegex.SubexpIndex("image")
 	tagIndex := imageRegex.SubexpIndex("tag")
-	
-	if regex.MatchString(container.Image) {
-		return true, matches[namespaceIndex], matches[imageIndex], matches[tagIndex], nil
-	}
-
-	return false, "", "", "", nil
+	return true, matches[namespaceIndex], matches[imageIndex], matches[tagIndex], nil
 }
 
-func mutateContainerImageSpec(imagespec string) (bool, error) {
-	matched, namespace, image, tag, err := checkContainerImageSpecByRegex(imagespec)
+// mutateContainerImageSpec mutates the container image specification if it matches the internal registry pattern and the namespace is openshift.
+func mutateContainerImageSpec(imagespec *string) (bool, error) {
+	matched, namespace, image, _, err := checkContainerImageSpecByRegex(*imagespec)
 	if err != nil {
-		return err
+		return false, err
 	}
 
-	if matched {
+	if matched && namespace == "openshift" {
 		// TODO: We need to pull the raw image spec to replace the image spec
 		// ImageStreams have the raw image spec by namespace and name ie: oc get is -A
-		// The current idea is to pull this from the cluster.. 
+		// The current idea is to pull this from the cluster..
 		// but seems heavy handed query Kube API on every pod admiission?
-		switch image:
-			case "cli":
-				container.Image = "cli"
-			case "tools":
-				container.Image = "tools"
+		switch image {
+		case "cli":
+			*imagespec = "quay.io/openshift-release-dev/ocp-v4.0-art-dev@sha256:0c8f996bb9fedc7d0681a80766b574a26dac51be7282ec5fd70ac4f699adb080"
+		case "tools":
+			*imagespec = "quay.io/openshift-release-dev/ocp-v4.0-art-dev@sha256:0c8f996bb9fedc7d0681a80766b574a26dac51be7282ec5fd70ac4f699adb080"
+		}
 	}
 
 	return matched, nil
@@ -223,11 +265,11 @@ func (s *PodImageSpecWebhook) SyncSetLabelSelector() metav1.LabelSelector {
 
 // ClassicEnabled indicates that this webhook is compatible with classic clusters
 func (s *PodImageSpecWebhook) ClassicEnabled() bool {
-	return false 
+	return false
 }
 
 // HypershiftEnabled indicates that this webhook is compatible with hosted
 // control plane clusters
 func (s *PodImageSpecWebhook) HypershiftEnabled() bool {
-	return true 
+	return true
 }

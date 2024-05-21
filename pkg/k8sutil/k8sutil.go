@@ -29,7 +29,7 @@ var (
 
 // ContainerClient Is a kubeclient that interacts with the Kube api through the service account that is running it
 type ContainerClient struct {
-	client client.Client
+	Client client.Client
 }
 
 // MustHaveContainerClient creates a new kubeclient that interacts with the Kube api with the service account secrets
@@ -45,7 +45,7 @@ func MustHaveContainerClient() *ContainerClient {
 	}
 
 	return &ContainerClient{
-		client: c,
+		Client: c,
 	}
 
 }
