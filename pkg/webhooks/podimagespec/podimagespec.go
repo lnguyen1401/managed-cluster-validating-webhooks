@@ -43,30 +43,39 @@ var (
 	}
 	log        = logf.Log.WithName(WebhookName)
 	imageRegex = regexp.MustCompile(`(image-registry\.openshift-image-registry\.svc:5000\/)(?P<namespace>\S*)(/)(?P<image>\S*)(:)(?P<tag>\S*)`)
-	kubeClient = k8sutil.MustHaveContainerClient()
 )
 
 // PodImageSpecWebhook mutates an image spec in a pod
 type PodImageSpecWebhook struct {
-	s        runtime.Scheme
-	configV1 configv1.Config
+	s          *runtime.Scheme
+	kubeClient client.Client
+	configV1   configv1.Config
 }
 
 // NewWebhook creates the new webhook
 func NewWebhook() *PodImageSpecWebhook {
 	scheme := runtime.NewScheme()
-	configV1 := &configv1.Config{}
+	err := configv1.Install(scheme)
+	if err != nil {
+		panic(err)
+	}
+
 	return &PodImageSpecWebhook{
-		s:        *scheme,
-		configV1: *configV1,
+		s: scheme,
 	}
 }
 
 // CheckImageRegistryStatus checks the status of the image registry service
 func (s *PodImageSpecWebhook) CheckImageRegistryStatus(ctx context.Context) (bool, error) {
-	err := kubeClient.Client.Get(ctx, client.ObjectKey{
-		Name: "cluster",
-	}, &s.configV1)
+	var err error
+	if s.kubeClient == nil {
+		s.kubeClient, err = k8sutil.KubeClient(s.s)
+		if err != nil {
+			return false, err
+		}
+	}
+
+	err = s.kubeClient.Get(ctx, client.ObjectKey{Name: "cluster"}, &s.configV1)
 	if err != nil {
 		return false, fmt.Errorf("failed to get image registry config: %v", err)
 	}
@@ -151,7 +160,7 @@ func (s *PodImageSpecWebhook) authorizeOrMutate(request admissionctl.Request) ad
 
 // renderPod renders the Pod in the admission Request
 func (s *PodImageSpecWebhook) renderPod(request admissionctl.Request) (*corev1.Pod, error) {
-	decoder, err := admissionctl.NewDecoder(&s.s)
+	decoder, err := admissionctl.NewDecoder(s.s)
 	if err != nil {
 		return nil, err
 	}
