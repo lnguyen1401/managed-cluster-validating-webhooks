@@ -68,9 +68,11 @@ func NewWebhook() *PodImageSpecWebhook {
 // CheckImageRegistryStatus checks the status of the image registry service
 func (s *PodImageSpecWebhook) CheckImageRegistryStatus(ctx context.Context) (bool, error) {
 	var err error
-	s.kubeClient, err = k8sutil.KubeClient(s.s)
-	if err != nil {
-		return false, err
+	if s.kubeClient == nil {
+		s.kubeClient, err = k8sutil.KubeClient(s.s)
+		if err != nil {
+			return false, err
+		}
 	}
 
 	err = s.kubeClient.Get(ctx, client.ObjectKey{Name: "cluster"}, &s.configV1)
