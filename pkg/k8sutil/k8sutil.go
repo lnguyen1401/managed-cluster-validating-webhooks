@@ -2,6 +2,7 @@ package k8sutil
 
 import (
 	"fmt"
+	"k8s.io/apimachinery/pkg/runtime"
 	"os"
 	"strings"
 
@@ -27,27 +28,22 @@ var (
 	ErrRunLocal     = fmt.Errorf("operator run mode forced to local")
 )
 
-// ContainerClient Is a kubeclient that interacts with the Kube api through the service account that is running it
-type ContainerClient struct {
-	Client client.Client
-}
-
-// MustHaveContainerClient creates a new kubeclient that interacts with the Kube api with the service account secrets
-func MustHaveContainerClient() *ContainerClient {
+// KubeClient creates a new kubeclient that interacts with the Kube api with the service account secrets
+func KubeClient(s *runtime.Scheme) (client.Client, error) {
 	config, err := rest.InClusterConfig()
 	if err != nil {
 		panic(`MustHaveContainerClient: unable to obtain cluster config` + err.Error())
 	}
 
-	c, err := client.New(config, client.Options{})
+	c, err := client.New(config, client.Options{
+		Scheme: s,
+	})
 	if err != nil {
-		panic(`MustHaveContainerClient: unable to create client` + err.Error())
+		return nil, err
+		//panic(`MustHaveContainerClient: unable to create client` + err.Error())
 	}
 
-	return &ContainerClient{
-		Client: c,
-	}
-
+	return c, nil
 }
 
 func isRunModeLocal() bool {
